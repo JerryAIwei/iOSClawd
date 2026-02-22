@@ -354,9 +354,253 @@ Swift Packages — same philosophy as nanoclawd's `git merge-file` skill engine.
 
 ---
 
+## Step-by-Step Goals
+
+Each goal maps to one roadmap phase. Every goal has a clear definition of done,
+concrete test cases, and the test method used to verify it.
+
+---
+
+### Goal 1 — Core Agent Loop
+
+**Objective:** A single agent can receive a text message, call the Claude API with
+streaming, display tokens as they arrive, and persist the conversation across
+app restarts.
+
+**Definition of done:**
+- `AgentQueue` actor serializes concurrent requests to the same agent
+- SSE stream delivers tokens to UI in real time
+- Conversation history survives app kill and relaunch
+- API key stored in Keychain, never in code or UserDefaults
+
+| # | Test Case | Expected Result |
+|---|---|---|
+| 1.1 | Send "Hello" to a fresh agent | Streaming response appears within 2s, tokens animate in |
+| 1.2 | Send two messages simultaneously to same agent | Second message queued; responses arrive in order, no interleaving |
+| 1.3 | Send messages to two different agents simultaneously | Both respond in parallel; neither blocks the other |
+| 1.4 | Kill app mid-response, relaunch | Conversation history restored; partial response shown as-is |
+| 1.5 | Enter wrong API key | Clear error message shown; no crash |
+| 1.6 | Send message with no network | Graceful error with retry option |
+| 1.7 | Simulate API 529 (overloaded) | Exponential backoff retried up to 5×; user sees progress |
+
+**Test method:**
+- 1.1–1.3, 1.5–1.6: **XCTest unit tests** on `AgentQueue` and `AnthropicClient`
+  using `URLProtocol` stub to mock SSE responses
+- 1.4: **XCUITest** — launch, send message, `XCUIApplication().terminate()`,
+  relaunch, assert message row exists
+- 1.7: **XCTest** with mock returning HTTP 529 three times then 200
+
+---
+
+### Goal 2 — Multi-Agent Orchestration
+
+**Objective:** An Orchestrator agent can decompose a user task into subtasks,
+delegate each to a specialized agent, and synthesize a final answer.
+
+**Definition of done:**
+- Orchestrator creates child `AgentTask` records in SwiftData
+- Each subtask runs in its own `AgentQueue` slot concurrently
+- Pipeline view shows subtask tree with live status per node
+- Final synthesized answer delivered to the user when all subtasks complete
+
+| # | Test Case | Expected Result |
+|---|---|---|
+| 2.1 | Ask orchestrator "Research Swift actors and write a code example" | Two subtasks created: Researcher + Coder; both run in parallel |
+| 2.2 | One subtask fails mid-run | Orchestrator receives error result; synthesizes partial answer with caveat |
+| 2.3 | Cancel pipeline mid-run | All in-flight `Task` handles cancelled within 1s; SwiftData status set to `.cancelled` |
+| 2.4 | Pipeline with 5 subtasks | All 5 run concurrently (subject to `MAX_CONCURRENT = 5` cap) |
+| 2.5 | Subtask produces a `tool_use` block | Tool executes, result injected, subtask continues correctly |
+| 2.6 | App backgrounds during pipeline | Pipeline continues via `BGProcessingTask`; result available on return |
+
+**Test method:**
+- 2.1–2.5: **XCTest** on `OrchestratorAgent` with mocked `AnthropicClient` that
+  returns preset subtask decomposition JSON
+- 2.3: Assert `Task.isCancelled` propagates within timeout using
+  `XCTestExpectation`
+- 2.6: **Manual test** on device — background app, wait 10s, return; verify result
+
+---
+
+### Goal 3 — Core Tools
+
+**Objective:** Agents can search the web, fetch URL content, and store/recall
+key-value memory within and across conversations.
+
+**Definition of done:**
+- `ToolRegistry` resolves tool name to `AgentTool` implementation
+- Tool results injected as `tool_result` blocks and loop continues
+- `memory` tool values survive app restart (stored in SwiftData)
+
+| # | Test Case | Expected Result |
+|---|---|---|
+| 3.1 | Agent calls `web_search("Swift concurrency")` | Returns ≥3 result snippets with titles and URLs |
+| 3.2 | Agent calls `fetch_url("https://swift.org")` | Returns extracted text, ≤4000 chars, no raw HTML tags |
+| 3.3 | Agent calls `memory set key="name" value="Jerry"` then later `memory get key="name"` | Returns "Jerry" in second call |
+| 3.4 | Kill and relaunch app; agent calls `memory get key="name"` | Still returns "Jerry" (persisted in SwiftData) |
+| 3.5 | Unknown tool name returned by Claude | `ToolRegistry` returns `.notFound` error; injected as `is_error: true` result |
+| 3.6 | `fetch_url` with non-200 response | Returns descriptive error string; agent handles gracefully |
+
+**Test method:**
+- 3.1–3.2: **XCTest** with live network (integration test, gated behind
+  `XCTSkipUnless(ProcessInfo.processInfo.environment["RUN_NETWORK_TESTS"] != nil)`)
+- 3.3–3.4: **XCTest** with in-memory SwiftData container for 3.3;
+  real on-disk container for 3.4
+- 3.5–3.6: **XCTest** unit tests with mock HTTP responses
+
+---
+
+### Goal 4 — Skill 1: Apple Shortcuts
+
+**Objective:** The agent can list, run, and design Apple Shortcuts to automate
+any app that exposes Shortcuts actions.
+
+**Definition of done:**
+- `list_shortcuts` returns all installed shortcuts by name
+- `run_shortcut(name)` opens the Shortcuts URL scheme and polls for result
+- Agent can complete an end-to-end task ("add a reminder") via Shortcuts
+
+| # | Test Case | Expected Result |
+|---|---|---|
+| 4.1 | Call `list_shortcuts()` | Returns list including at least one system shortcut |
+| 4.2 | Call `run_shortcut("Get Battery Level")` | Returns battery % as string |
+| 4.3 | Ask agent "Add a reminder: buy milk at 8pm" | Agent calls `run_shortcut` with correct Reminders shortcut; reminder appears in Reminders app |
+| 4.4 | Call `run_shortcut("NonExistentShortcut")` | Returns error "Shortcut not found"; agent tries alternative |
+| 4.5 | Shortcut takes >10s to run | Tool waits up to 30s; returns timeout error with partial result if available |
+
+**Test method:**
+- 4.1: **XCUITest** — launch app, trigger `list_shortcuts`, assert non-empty array
+- 4.2, 4.5: **Manual test** on physical device (Simulator lacks Shortcuts app)
+- 4.3: **Manual end-to-end test** — verify reminder in Reminders.app after agent run
+- 4.4: **XCTest** unit test — mock URL scheme handler returns not-found
+
+---
+
+### Goal 5 — Skill 2: Native iOS Frameworks
+
+**Objective:** The agent can read and write data in Calendar, Reminders,
+Contacts, Photos, Health, Home, and Music without using the UI.
+
+**Definition of done:**
+- Each framework tool requests the correct permission on first use
+- CRUD operations reflect immediately in the corresponding Apple app
+- Errors (permission denied, not found) returned as structured strings
+
+| # | Test Case | Expected Result |
+|---|---|---|
+| 5.1 | Ask agent "Schedule a meeting tomorrow at 3pm called Team Sync" | Event appears in Calendar.app with correct time |
+| 5.2 | Ask agent "What's my step count today?" | Returns today's step count from HealthKit |
+| 5.3 | Ask agent "Find contact named Tim Cook" | Returns name, email, phone from Contacts |
+| 5.4 | Ask agent "Turn off the living room lights" | HomeKit `home_control` toggles the accessory off |
+| 5.5 | Call any tool with permission denied | Returns "Permission denied for [framework]" and prompts user to grant in Settings |
+| 5.6 | `calendar` tool creates duplicate event on retry | SwiftData idempotency key prevents duplicate EKEvent insertion |
+
+**Test method:**
+- 5.1, 5.3: **XCTest** with `EventKit`/`Contacts` in-memory store mock
+- 5.2: **XCTest** with `HKHealthStore` mock (inject mock query results)
+- 5.4: **Manual test** on device with real HomeKit accessories (or HomeKit Accessory Simulator)
+- 5.5: **XCTest** — set authorization status to `.denied` via mock store, assert error string
+- 5.6: **XCTest** unit test — call `calendar create` twice with same idempotency key, assert one event
+
+---
+
+### Goal 6 — Skill 3: Accessibility Snapshot + Tap
+
+**Objective:** The agent can read the current screen's element tree and inject
+taps and text, enabling it to operate any app that has accessibility support.
+
+**Definition of done:**
+- `screen_snapshot()` returns a labeled, hierarchical text description of all
+  visible interactive elements
+- `tap_element(label)` correctly activates the matching element
+- The agent can navigate a real app (e.g., open Settings > WiFi) using only
+  snapshot + tap calls
+
+| # | Test Case | Expected Result |
+|---|---|---|
+| 6.1 | Call `screen_snapshot()` on the app's own Chat screen | Returns structured list with element labels, roles, and frame hints |
+| 6.2 | Call `screen_snapshot(interactive_only: true)` | Returns only tappable/editable elements |
+| 6.3 | Call `tap_element("Send")` when Send button visible | Button activates; message sends |
+| 6.4 | Call `tap_element("ElementThatDoesNotExist")` | Returns "Element not found"; no crash |
+| 6.5 | Ask agent "Open Settings and turn on Airplane Mode" | Agent calls snapshot repeatedly, taps correct elements in sequence |
+| 6.6 | Call `type_text("Hello")` with text field focused | "Hello" appears in field |
+
+**Test method:**
+- 6.1–6.2: **XCUITest** — launch test host app, call `screen_snapshot()`,
+  assert known elements appear in output string
+- 6.3, 6.6: **XCUITest** — inject tap/type via `XCUIElement` proxy, assert UI state changes
+- 6.4: **XCTest** unit test — mock accessibility tree with no matching element
+- 6.5: **Manual end-to-end test** on device; record screen for review
+
+---
+
+### Goal 7 — Skill 4: Screen Capture + Claude Vision
+
+**Objective:** The agent can capture a screenshot, understand it via Claude's
+vision API, and act on what it sees — enabling automation of any app regardless
+of accessibility support.
+
+**Definition of done:**
+- `capture_screen()` returns a valid base64 PNG via ReplayKit
+- `analyze_screen(question)` returns a Claude vision response describing or
+  answering questions about the current screen
+- `find_and_tap(description)` correctly locates and taps a described element
+  in an app with no accessibility labels
+
+| # | Test Case | Expected Result |
+|---|---|---|
+| 7.1 | Call `capture_screen()` | Returns non-empty base64 string; decoded PNG matches current screen |
+| 7.2 | Call `analyze_screen("What app is open?")` | Claude returns correct app name |
+| 7.3 | Call `read_screen_text()` on a screen with visible text | Returns OCR'd text matching what's visible (≥80% accuracy) |
+| 7.4 | Call `find_and_tap("the blue Submit button")` | Claude identifies coordinates; tap fires at correct location |
+| 7.5 | Call `watch_screen("loading spinner is gone", timeout: 10)` | Polls every 500ms; resolves when spinner disappears |
+| 7.6 | Screen capture permission denied by user | Returns "Screen recording permission required" error; shows permission prompt |
+| 7.7 | App with no accessibility labels (e.g., a game) | `find_and_tap` still works via vision coordinates |
+
+**Test method:**
+- 7.1: **XCTest** — call `capture_screen()`, base64-decode, assert `UIImage(data:)` non-nil
+- 7.2–7.4: **Integration test** with live Claude API (gated behind env flag);
+  manual verification of visual accuracy
+- 7.3: **XCTest** — render a `UILabel` with known text offscreen, run Vision OCR, assert ≥80% match
+- 7.5: **XCTest** with mock screen states — assert polling stops at correct state
+- 7.6: **XCTest** — mock `RPScreenRecorder.isAvailable = false`, assert error returned
+- 7.7: **Manual end-to-end test** on device with a target app
+
+---
+
+### Goal 8 — Polish
+
+**Objective:** The app is production-ready: responses render beautifully,
+token costs are visible, and conversations can be exported.
+
+**Definition of done:**
+- Markdown in agent responses renders with correct formatting
+- Code blocks have syntax highlighting per language
+- Each task shows input/output token count and estimated USD cost
+- Conversations exportable as Markdown or JSON
+
+| # | Test Case | Expected Result |
+|---|---|---|
+| 8.1 | Agent responds with `**bold**`, `# heading`, ` ```swift ``` ` | Renders bold text, large heading, highlighted Swift code block |
+| 8.2 | Agent responds with a table in Markdown | Table renders with borders and alternating row colors |
+| 8.3 | Complete a task; view Agent Detail | Token usage (input + output) and estimated cost (USD) displayed |
+| 8.4 | Export conversation as Markdown | File saved to Files.app; content matches messages verbatim |
+| 8.5 | Export conversation as JSON | Valid JSON with `role`, `content`, `timestamp` fields per message |
+| 8.6 | Render a 500-line streaming response | No frame drops below 60fps during streaming (measured by Instruments) |
+
+**Test method:**
+- 8.1–8.2: **XCUITest** — assert rendered `Text` or `WebView` contains expected
+  attributed string elements (bold, heading font size, monospace font)
+- 8.3: **XCTest** — mock API response with known `usage` block; assert cost label text
+- 8.4–8.5: **XCTest** — export to temp directory, read file, assert content/schema
+- 8.6: **Instruments Time Profiler** on physical device; assert Core Animation
+  commit time ≤16ms during streaming
+
+---
+
 ## Commit History
 
 | Commit | Description |
 |---|---|
 | `initial` | Add DESIGN.md — architecture, components, roadmap |
 | `redesign` | Rebase on nanoclawd Swift port; add four-layer iOS skills system |
+| `goals` | Add step-by-step goals with test cases and test methods per phase |
